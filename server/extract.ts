@@ -45,8 +45,23 @@ function normalizeWhitespace(text: string): string {
 }
 
 async function extractDocx(buffer: Buffer): Promise<string> {
-  const result = await mammoth.extractRawText({ buffer });
-  return result.value ?? "";
+  const [rawText, html] = await Promise.all([
+    mammoth.extractRawText({ buffer }),
+    mammoth.convertToHtml({ buffer }),
+  ]);
+  const $ = cheerio.load(html.value ?? "");
+  const tableRows = $("table tr")
+    .map((_, row) =>
+      $(row)
+        .find("th, td")
+        .map((_, cell) => $(cell).text().replace(/\s+/g, " ").trim())
+        .get()
+        .join(" | ")
+    )
+    .get()
+    .filter((row) => row.trim().length > 0);
+
+  return [rawText.value ?? "", ...(tableRows.length > 0 ? ["\nStructured table rows:\n", ...tableRows] : [])].join("\n");
 }
 
 async function extractPdf(buffer: Buffer): Promise<string> {

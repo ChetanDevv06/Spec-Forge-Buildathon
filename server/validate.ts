@@ -47,6 +47,8 @@ export function v1CoCountConsistency(output: SpecForgeOutput): Defect[] {
   const coIds = output.course_outcomes.map((c) => c.id);
   const mapIds = Object.keys(output.co_po_pso_map);
   const covIds = Object.keys(output.assessment.co_coverage);
+  const missingMapIds = coIds.filter((id) => !mapIds.includes(id));
+  const missingCoverageIds = coIds.filter((id) => !covIds.includes(id));
 
   if (mapIds.length !== coIds.length) {
     issues.push(
@@ -54,7 +56,7 @@ export function v1CoCountConsistency(output: SpecForgeOutput): Defect[] {
         "CO_MISSING_IN_TABLE",
         "spec",
         5,
-        [],
+        missingMapIds,
         `Section 3 defines ${coIds.length} CO(s) [${coIds.join(", ")}] but Section 5 map has ${mapIds.length} row(s) [${mapIds.join(", ")}].`,
         "Ensure co_po_pso_map has exactly one row per defined CO."
       )
@@ -66,7 +68,7 @@ export function v1CoCountConsistency(output: SpecForgeOutput): Defect[] {
         "CO_ASSESSMENT_MISMATCH",
         "spec",
         7,
-        [],
+        missingCoverageIds,
         `Section 3 defines ${coIds.length} CO(s) [${coIds.join(", ")}] but Section 7 coverage has ${covIds.length} entr(ies) [${covIds.join(", ")}].`,
         "Ensure assessment.co_coverage contains an entry for every defined CO."
       )

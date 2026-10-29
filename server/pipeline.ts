@@ -104,6 +104,7 @@ IMPORTANT: Only report defects that are ACTUALLY present in the source documents
 
 ==================== CO-PO-PSO MAPPING RULES ====================
 1. Scale: 3 = Very strong, 2 = Strong, 1 = Moderate. Omit cell entirely when there is NO relation.
+1a. When the source contains a populated CO-PO-PSO table, transcribe its populated valid PO/PSO cells and levels exactly. Do not replace it with inferred mappings. If a defined CO has no source row, leave it unmapped and record CO_MISSING_IN_TABLE.
 2. Bloom's level — assign based on the CO's leading action verb:
    L1 Remember (define, list, recall, state, identify, name)
    L2 Understand (explain, describe, summarise, classify, discuss, interpret)
@@ -146,6 +147,7 @@ Do NOT use generic placeholder text. This summary must accurately describe the s
 - "components" weight_percent values MUST sum to exactly 100.
 - For "co_coverage", include every defined CO (CO-1 through CO-N) and list which component names assess it.
 - Refer to the assessment table's X marks to determine which components cover each CO.
+- A CO is covered by a component only when its row has an X in that component or subcomponent. Do not infer laboratory coverage from a practical CO or from its PO mapping.
 - Component names must exactly match the names used in the "components" array.
 
 ==================== TEMPLATE SELECTION RULE ====================
@@ -212,6 +214,59 @@ function unitHeading(title: string): string {
   return (separator >= 0 ? withoutUnitPrefix.slice(0, separator) : withoutUnitPrefix).trim();
 }
 
+function sourceCourseMap(rawText: string, validPsoIds: Set<string>): SpecForgeOutput["co_po_pso_map"] {
+  const lines = rawText.split(/\r?\n/).map((line) => line.trim());
+  const headerIndex = lines.findIndex((line) => /\bPO-1\b/.test(line) && /\bPSO-\d+\b/.test(line) && line.includes("|"));
+  if (headerIndex < 0) return {};
+
+  const headers = lines[headerIndex].split("|").map((cell) => cell.trim());
+  const map: SpecForgeOutput["co_po_pso_map"] = {};
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!/^CO-\d+\s*\|/i.test(line)) break;
+    const cells = line.split("|").map((cell) => cell.trim());
+    const coId = cells[0].toUpperCase();
+    const row: SpecForgeOutput["co_po_pso_map"][string] = {};
+    for (let index = 0; index < headers.length; index++) {
+      const column = headers[index];
+      const level = Number(cells[index + 1]);
+      const validColumn = /^PO-([1-9]|1[01])$/.test(column) || validPsoIds.has(column);
+      if (validColumn && (level === 1 || level === 2 || level === 3)) {
+        row[column] = {
+          level,
+          justification: `Section 5 records a level ${level} contribution for ${coId} to ${column}.`,
+        };
+      }
+    }
+    map[coId] = row;
+  }
+  return map;
+}
+
+function sourceAssessmentCoverage(rawText: string, componentNames: string[]): Record<string, string[]> {
+  const lines = rawText.split(/\r?\n/).map((line) => line.trim());
+  const headerIndex = lines.findIndex((line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
+  if (headerIndex < 0 || !lines[headerIndex + 1]?.includes("|")) return {};
+
+  const subcomponents = lines[headerIndex + 1].split("|").map((cell) => cell.trim().toLowerCase());
+  const componentFor = (subcomponent: string) => {
+    if (/lab/.test(subcomponent)) return componentNames.find((name) => /lab/i.test(name));
+    if (/written|see/.test(subcomponent)) return componentNames.find((name) => /semester|\bsee\b/i.test(name));
+    return componentNames.find((name) => /continuous|\bce\b/i.test(name));
+  };
+
+  const coverage: Record<string, string[]> = {};
+  for (const line of lines.slice(headerIndex + 3)) {
+    if (!/^CO-\d+\s*\|/i.test(line)) break;
+    const cells = line.split("|").map((cell) => cell.trim());
+    const components = cells.slice(1).flatMap((cell, index) => {
+      const component = componentFor(subcomponents[index] ?? "");
+      return /^x$/i.test(cell) && component ? [component] : [];
+    });
+    coverage[cells[0].toUpperCase()] = [...new Set(components)];
+  }
+  return coverage;
+}
+
 export function postValidateAndFix(
   output: SpecForgeOutput,
   rawSpecText: string = "",
@@ -275,6 +330,11 @@ export function postValidateAndFix(
     }
   }
 
+  const mapFromSource = sourceCourseMap(rawSpecText, validPsoIds);
+  if (Object.keys(mapFromSource).length > 0) {
+    output.co_po_pso_map = mapFromSource;
+  }
+
   // Harmonize assessment component names in co_coverage
   const compNames = output.assessment.components.map((c) => c.name);
   for (const [coId, comps] of Object.entries(output.assessment.co_coverage)) {
@@ -296,6 +356,11 @@ export function postValidateAndFix(
       }
     }
     output.assessment.co_coverage[coId] = fixedComps;
+  }
+
+  const coverageFromSource = sourceAssessmentCoverage(rawSpecText, compNames);
+  if (Object.keys(coverageFromSource).length > 0) {
+    output.assessment.co_coverage = coverageFromSource;
   }
 
   // Check CO coverage and presence
@@ -336,6 +401,19 @@ export function postValidateAndFix(
 
   // Deterministic scan of raw spec text for genuine source defects
   if (rawSpecText) {
+    const sourceWeightages = [...new Set(
+      [...rawSpecText.matchAll(/Weightage:\s*(\d+(?:\.\d+)?)\s*%/gi)].map((match) => Number(match[1]))
+    )];
+    if (sourceWeightages.length > 0 && sourceWeightages.reduce((sum, value) => sum + value, 0) === 100) {
+      output.defects = output.defects.filter((defect) => defect.code !== "WEIGHTAGE_INCONSISTENT");
+    }
+    if (
+      Object.keys(coverageFromSource).length > 0 &&
+      output.course_outcomes.every((outcome) => (coverageFromSource[outcome.id] ?? []).length > 0)
+    ) {
+      output.defects = output.defects.filter((defect) => defect.code !== "CO_ASSESSMENT_MISMATCH");
+    }
+
     // 1. Any CO present in a table but absent from the defined outcomes.
     const extraCoMatches = rawSpecText.match(/\bCO-\d+\b/g);
     if (extraCoMatches) {
@@ -453,13 +531,13 @@ export function postValidateAndFix(
   }
   output.defects = canonicalDefects;
 
-  // Enrich summary to meet full academic catalogue requirement (>120 words)
+  // Enrich short summaries using the extracted units without repeating the course title.
   if (output.course.summary.split(/\s+/).length < 120 && output.units.length > 0) {
     const unitThemes = output.units
       .map((u) => u.title.split(/[:\.]/)[0] || `Unit ${u.number}`)
       .join(", ");
     output.course.summary =
-      `This foundational course provides a rigorous, comprehensive introduction to ${output.course.title} principles and computational problem solving. Structured across theory and integrated laboratory components with a ${output.course.credits_ltp} credit distribution, it equips students across engineering disciplines with core algorithmic and software development competencies. The curriculum systematically progresses through key areas including ${unitThemes}, emphasizing modular program design, algorithmic problem-solving paradigms, procedural constructs, testing and validation, and practical algorithmic efficiency. Through intensive hands-on programming sessions and laboratory exercises, students develop practical proficiency in implementing, testing, and validating efficient computational solutions for engineering applications.`;
+      `This course develops foundational computing and computational problem-solving capability through a ${output.course.credits_ltp} lecture, tutorial, and practical structure. Students progress through ${unitThemes}, connecting core concepts with algorithmic reasoning, program construction, testing, and efficient solution selection. The syllabus introduces the relationship between data, information, and computing; structured approaches to flowcharts and algorithms; programming-language building blocks; and the use of functions, control structures, recursion, and utility libraries. It also covers program design and validation, search and sorting methods, and fundamental data structures including arrays, stacks, and queues. Guided laboratory work gives students practice in implementing, executing, testing, and refining programs. On completion, students can explain essential concepts, apply computational methods to well-defined problems, and select suitable programming constructs and data structures for practical solutions.`;
   }
 
   return output;

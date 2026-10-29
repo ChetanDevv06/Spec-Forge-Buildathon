@@ -331,6 +331,39 @@ function postValidateAndFix(output: SpecForgeOutput): SpecForgeOutput {
     }
   }
 
+  // Normalize defect refs and sections to canonical format
+  for (const d of output.defects) {
+    if (d.location.refs && d.location.refs.length > 0) {
+      const cleanRefs: string[] = [];
+      for (const r of d.location.refs) {
+        const tokenMatches = r.match(/\b(CO-\d+|PO-\d+|PSO-\d+|Unit-\d+)\b/gi);
+        if (tokenMatches) {
+          for (const m of tokenMatches) {
+            const up = m.toUpperCase();
+            if (!cleanRefs.includes(up)) cleanRefs.push(up);
+          }
+        } else if (r.trim()) {
+          cleanRefs.push(r.trim());
+        }
+      }
+      if (cleanRefs.length > 0) d.location.refs = cleanRefs;
+    }
+
+    if (d.location.section == null) {
+      if (d.code === "CO_EXTRA_IN_TABLE") {
+        d.location.section = 7;
+      } else if (d.code === "PSO_COLUMN_MISMATCH") {
+        d.location.section = 5;
+      } else if (d.code === "HOURS_INCONSISTENT") {
+        d.location.section = 2;
+      } else if (d.code === "WEIGHTAGE_INCONSISTENT" || d.code === "CO_ASSESSMENT_MISMATCH") {
+        d.location.section = 7;
+      } else if (d.code === "CO_MISSING_IN_TABLE") {
+        d.location.section = 5;
+      }
+    }
+  }
+
   return output;
 }
 

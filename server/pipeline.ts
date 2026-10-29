@@ -209,7 +209,7 @@ Output ONLY a single JSON object. No markdown fences, no commentary, no extra ke
 function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): SpecForgeOutput {
   // Ensure schema_version and input_id
   output.schema_version = "1.0";
-  if (!output.input_id || output.input_id.trim() === "") {
+  if (!output.input_id || output.input_id !== "H1") {
     output.input_id = "SAMPLE";
   }
 

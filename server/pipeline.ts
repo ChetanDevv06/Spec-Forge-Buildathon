@@ -180,7 +180,7 @@ Output ONLY a single JSON object. No markdown fences, no commentary, no extra ke
     { "id": "CO-1", "statement": string (exact text from blueprint if available), "bloom_level": 1-6 }
   ],
   "units": [
-    { "number": 1, "title": string (exact unit title and content from blueprint), "lab": string | null }
+    { "number": 1, "title": string (the unit heading only, for example "Introduction"), "lab": string | null }
   ],
   "co_po_pso_map": {
     "CO-1": {
@@ -206,7 +206,17 @@ Output ONLY a single JSON object. No markdown fences, no commentary, no extra ke
 
 
 
-function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): SpecForgeOutput {
+function unitHeading(title: string): string {
+  const withoutUnitPrefix = title.replace(/^\s*Unit\s*\d+\s*[:.-]?\s*/i, "").trim();
+  const separator = withoutUnitPrefix.search(/\s*:\s*/);
+  return (separator >= 0 ? withoutUnitPrefix.slice(0, separator) : withoutUnitPrefix).trim();
+}
+
+export function postValidateAndFix(
+  output: SpecForgeOutput,
+  rawSpecText: string = "",
+  rawBlueprintText: string = ""
+): SpecForgeOutput {
   // Ensure schema_version and input_id
   output.schema_version = "1.0";
   if (!output.input_id || output.input_id !== "H1") {
@@ -238,6 +248,13 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
     output.teaching_hours = { ...th, total: computedHours };
   }
 
+  // The output schema stores a unit heading, not a second free-form content
+  // field. Models frequently put "Heading: full syllabus text" in title;
+  // retain the source heading used by the template and keep lab work separate.
+  output.units = output.units
+    .map((unit) => ({ ...unit, title: unitHeading(unit.title) }))
+    .sort((a, b) => a.number - b.number);
+
   // Load valid PSO IDs (synchronous)
   const validPsoIds = new Set<string>();
   try {
@@ -245,8 +262,8 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
     const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     for (const pso of cfg.psos ?? []) validPsoIds.add(pso.id);
   } catch {
-    validPsoIds.add("PSO-1");
-    validPsoIds.add("PSO-2");
+    // Keep generated evidence intact if the authoritative configuration cannot
+    // be loaded. The request will fail later when configuration is required.
   }
 
   // Remove invalid PSO columns from CO-PO map
@@ -260,8 +277,6 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
 
   // Harmonize assessment component names in co_coverage
   const compNames = output.assessment.components.map((c) => c.name);
-  const labComp = compNames.find((n) => n.toLowerCase().includes("lab")) ?? compNames[compNames.length - 1];
-
   for (const [coId, comps] of Object.entries(output.assessment.co_coverage)) {
     const fixedComps: string[] = [];
     for (const cName of comps) {
@@ -280,39 +295,27 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
         if (matched && !fixedComps.includes(matched)) fixedComps.push(matched);
       }
     }
-    // Rule V9: COs mapped 2 or 3 to PO-3 or PO-5 must be assessed in practical/assignment component
-    const row = output.co_po_pso_map[coId] ?? {};
-    const strongPractical = (row["PO-3"]?.level ?? 0) >= 2 || (row["PO-5"]?.level ?? 0) >= 2;
-    if (strongPractical && labComp && !fixedComps.includes(labComp)) {
-      fixedComps.push(labComp);
-    }
-    output.assessment.co_coverage[coId] =
-      fixedComps.length > 0 ? fixedComps : [compNames[0] ?? "Continuous Evaluation"];
+    output.assessment.co_coverage[coId] = fixedComps;
   }
 
   // Check CO coverage and presence
   const coIds = new Set(output.course_outcomes.map((co) => co.id));
   for (const co of output.course_outcomes) {
     if (!output.co_po_pso_map[co.id]) {
-      output.co_po_pso_map[co.id] = {
-        "PO-1": { level: 2, justification: "Contributes to foundational engineering knowledge." },
-      };
       output.defects.push({
         code: "CO_MISSING_IN_TABLE",
         location: { source: "spec", section: 5, refs: [co.id] },
         description: `${co.id} was missing from the CO-PO map table.`,
-        fix: `Added default mapping for ${co.id}.`,
+        fix: `Add the source-supported ${co.id} mapping to the CO-PO-PSO table.`,
       });
     }
 
     if (!output.assessment.co_coverage[co.id] || output.assessment.co_coverage[co.id].length === 0) {
-      const defaultComp = compNames[0] ?? "Continuous Evaluation";
-      output.assessment.co_coverage[co.id] = [defaultComp];
       output.defects.push({
         code: "CO_ASSESSMENT_MISMATCH",
         location: { source: "spec", section: 7, refs: [co.id] },
         description: `${co.id} was not mapped to any assessment component.`,
-        fix: `Mapped ${co.id} to ${defaultComp}.`,
+        fix: `Record the source-supported assessment component(s) for ${co.id}.`,
       });
     }
   }
@@ -333,8 +336,8 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
 
   // Deterministic scan of raw spec text for genuine source defects
   if (rawSpecText) {
-    // 1. Extra CO in tables (e.g. CO-6 in Section 7 assessment table)
-    const extraCoMatches = rawSpecText.match(/\bCO-([6-9]|\d{2,})\b/g);
+    // 1. Any CO present in a table but absent from the defined outcomes.
+    const extraCoMatches = rawSpecText.match(/\bCO-\d+\b/g);
     if (extraCoMatches) {
       const extraCos = [...new Set(extraCoMatches)].filter((cid) => !coIds.has(cid));
       for (const extraCo of extraCos) {
@@ -360,27 +363,16 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
       }
     }
 
-    // 2. PSO-3 column in Section 5
-    if (rawSpecText.includes("PSO-3")) {
-      const existing = output.defects.find(
-        (d) =>
-          d.code === "PSO_COLUMN_MISMATCH" ||
-          d.description.includes("PSO-3") ||
-          (d.location.refs && d.location.refs.includes("PSO-3"))
-      );
-      if (existing) {
-        existing.code = "PSO_COLUMN_MISMATCH";
-        existing.location = { source: "spec", section: 5, refs: ["PSO-3"] };
-        existing.description =
-          "The CO-PO-PSO map contains a PSO-3 column, which is not defined in the programme PSO reference data (only PSO-1 and PSO-2 are valid).";
-        existing.fix = "Removed PSO-3 column from the CO-PO-PSO map.";
-      } else {
+    // 2. Compare every PSO column mentioned in the source with Annexure config.
+    for (const psoId of new Set(rawSpecText.match(/\bPSO-\d+\b/gi) ?? [])) {
+      if (validPsoIds.has(psoId)) continue;
+      const existing = output.defects.find((d) => d.code === "PSO_COLUMN_MISMATCH" && d.location.refs?.includes(psoId));
+      if (!existing) {
         output.defects.push({
           code: "PSO_COLUMN_MISMATCH",
-          location: { source: "spec", section: 5, refs: ["PSO-3"] },
-          description:
-            "The CO-PO-PSO map contains a PSO-3 column, which is not defined in the programme PSO reference data (only PSO-1 and PSO-2 are valid).",
-          fix: "Removed PSO-3 column from the CO-PO-PSO map.",
+          location: { source: "spec", section: 5, refs: [psoId] },
+          description: `The CO-PO-PSO map contains ${psoId}, which is not defined in the programme PSO reference data.`,
+          fix: `Remove ${psoId} from the map or obtain its official programme statement before using it.`,
         });
       }
     }
@@ -406,16 +398,18 @@ function postValidateAndFix(output: SpecForgeOutput, rawSpecText: string = ""): 
       }
     }
 
-    // 4. Assessment weightage inconsistency
-    if (rawSpecText.includes("Weightage: 15 %") || rawSpecText.includes("Weightage: 15%")) {
-      const existing = output.defects.find((d) => d.code === "WEIGHTAGE_INCONSISTENT");
+    // 4. Blueprint examination maximum must agree with the printed unit total.
+    const maximumMarks = rawBlueprintText.match(/Maximum\s+Marks\s+(\d+)/i)?.[1];
+    const totalMarks = rawBlueprintText.match(/Total\s+Marks\s+(\d+)/i)?.[1];
+    if (maximumMarks && totalMarks && maximumMarks !== totalMarks) {
+      const existing = output.defects.find((d) => d.code === "MARKS_INCONSISTENT");
       if (!existing) {
         output.defects.push({
-          code: "WEIGHTAGE_INCONSISTENT",
-          location: { source: "spec", section: 7, refs: [] },
+          code: "MARKS_INCONSISTENT",
+          location: { source: "blueprint", section: null, refs: [] },
           description:
-            "Assessment sub-component marks in Section 7 show discrepancies with stated component percentages (e.g., Lab weightage 15% with 55 combined sub-component marks).",
-          fix: "Harmonized component weightages so Continuous Evaluation (60%), Semester End Exam (25%), and Laboratory (15%) sum to exactly 100%.",
+            `The blueprint states a maximum of ${maximumMarks} marks but prints a unit-wise total of ${totalMarks} marks.`,
+          fix: "Correct either the stated maximum marks or the unit-wise marks so both totals agree.",
         });
       }
     }
@@ -497,7 +491,7 @@ export async function runGenerationPipeline(
   }
 
   // 5. Post-validation & defect normalization
-  const finalOutput = postValidateAndFix(generatedData, spec.text);
+  const finalOutput = postValidateAndFix(generatedData, spec.text, blueprint?.text ?? "");
 
   // 6. Validate again through Zod to guarantee schema conformance
   const parseCheck = SpecForgeOutputSchema.safeParse(finalOutput);

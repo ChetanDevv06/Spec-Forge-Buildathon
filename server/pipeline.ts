@@ -215,26 +215,33 @@ function unitHeading(title: string): string {
   return (separator >= 0 ? withoutUnitPrefix.slice(0, separator) : withoutUnitPrefix).trim();
 }
 
-function sourceCourseMap(rawText: string, validPsoIds: Set<string>): SpecForgeOutput["co_po_pso_map"] {
+function normalizedMappingColumn(value: string): string | null {
+  const match = value.trim().toUpperCase().match(/^(PS?O)\s*-?\s*(\d+)$/);
+  return match ? `${match[1]}-${match[2]}` : null;
+}
+
+export function sourceCourseMap(rawText: string, validPsoIds: Set<string>): SpecForgeOutput["co_po_pso_map"] {
   const lines = rawText.split(/\r?\n/).map((line) => line.trim());
-  const headerIndex = lines.findIndex((line) => /\bPO-1\b/.test(line) && /\bPSO-\d+\b/.test(line) && line.includes("|"));
+  const headerIndex = lines.findIndex((line) => /\bPO[-\s]?1\b/i.test(line) && /\bPSO[-\s]?\d+\b/i.test(line) && line.includes("|"));
   if (headerIndex < 0) return {};
 
-  const headers = lines[headerIndex].split("|").map((cell) => cell.trim());
+  const headers = lines[headerIndex].split("|").map(normalizedMappingColumn);
+  if (!headers.includes("PO-1") || !headers.some((column) => column?.startsWith("PSO-"))) return {};
   const map: SpecForgeOutput["co_po_pso_map"] = {};
   for (const line of lines.slice(headerIndex + 1)) {
     if (!/^CO-\d+\s*\|/i.test(line)) break;
     const cells = line.split("|").map((cell) => cell.trim());
+    if (cells.length !== headers.length + 1) return {};
     const coId = cells[0].toUpperCase();
     const row: SpecForgeOutput["co_po_pso_map"][string] = {};
     for (let index = 0; index < headers.length; index++) {
       const column = headers[index];
-      const level = Number(cells[index + 1]);
-      const validColumn = /^PO-([1-9]|1[01])$/.test(column) || validPsoIds.has(column);
+      const level = Number(cells[index + 1].trim());
+      const validColumn = column != null && (/^PO-([1-9]|1[01])$/.test(column) || validPsoIds.has(column));
       if (validColumn && (level === 1 || level === 2 || level === 3)) {
         row[column] = {
           level,
-          justification: `Section 5 records a level ${level} contribution for ${coId} to ${column}.`,
+          justification: `The authoritative Section 5 matrix assigns a level ${level} contribution from ${coId} to ${column}.`,
         };
       }
     }
@@ -243,22 +250,61 @@ function sourceCourseMap(rawText: string, validPsoIds: Set<string>): SpecForgeOu
   return map;
 }
 
-function sourceAssessmentCoverage(rawText: string, componentNames: string[]): Record<string, string[]> {
+function tableCoIds(rawText: string, header: (line: string) => boolean): string[] {
+  const lines = rawText.split(/\r?\n/).map((line) => line.trim());
+  const headerIndex = lines.findIndex(header);
+  if (headerIndex < 0) return [];
+  const ids: string[] = [];
+  let foundRow = false;
+  for (const line of lines.slice(headerIndex + 1)) {
+    const match = line.match(/^(CO-\d+)\s*\|/i);
+    if (!match) {
+      if (foundRow) break;
+      continue;
+    }
+    foundRow = true;
+    ids.push(match[1].toUpperCase());
+  }
+  return [...new Set(ids)];
+}
+
+function sourceMapPsoColumns(rawText: string): string[] {
+  const header = rawText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /\bPO[-\s]?1\b/i.test(line) && /\bPSO[-\s]?\d+\b/i.test(line) && line.includes("|"));
+  return header
+    ? header.split("|").map(normalizedMappingColumn).filter((column): column is string => column?.startsWith("PSO-") ?? false)
+    : [];
+}
+
+export function sourceAssessmentCoverage(rawText: string, componentNames: string[]): Record<string, string[]> {
   const lines = rawText.split(/\r?\n/).map((line) => line.trim());
   const headerIndex = lines.findIndex((line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
   if (headerIndex < 0 || !lines[headerIndex + 1]?.includes("|")) return {};
 
   const subcomponents = lines[headerIndex + 1].split("|").map((cell) => cell.trim().toLowerCase());
   const componentFor = (subcomponent: string) => {
-    if (/lab/.test(subcomponent)) return componentNames.find((name) => /lab/i.test(name));
+    if (/lab\s*(ce|continuous)|continuous.*lab/.test(subcomponent)) {
+      return componentNames.find((name) => /continuous|\bce\b/i.test(name));
+    }
+    if (/lsee|lab.*(exam|see)|practical.*exam/.test(subcomponent)) {
+      return componentNames.find((name) => /lab/i.test(name));
+    }
     if (/written|see/.test(subcomponent)) return componentNames.find((name) => /semester|\bsee\b/i.test(name));
     return componentNames.find((name) => /continuous|\bce\b/i.test(name));
   };
 
   const coverage: Record<string, string[]> = {};
-  for (const line of lines.slice(headerIndex + 3)) {
-    if (!/^CO-\d+\s*\|/i.test(line)) break;
+  let foundRow = false;
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!/^CO-\d+\s*\|/i.test(line)) {
+      if (foundRow) break;
+      continue;
+    }
+    foundRow = true;
     const cells = line.split("|").map((cell) => cell.trim());
+    if (cells.length !== subcomponents.length + 1) return {};
     const components = cells.slice(1).flatMap((cell, index) => {
       const component = componentFor(subcomponents[index] ?? "");
       return /^x$/i.test(cell) && component ? [component] : [];
@@ -268,7 +314,7 @@ function sourceAssessmentCoverage(rawText: string, componentNames: string[]): Re
   return coverage;
 }
 
-function sourceAssessmentComponents(rawText: string): SpecForgeOutput["assessment"]["components"] {
+export function sourceAssessmentComponents(rawText: string): SpecForgeOutput["assessment"]["components"] {
   const header = rawText
     .split(/\r?\n/)
     .find((line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
@@ -469,11 +515,11 @@ export function postValidateAndFix(
       output.defects = output.defects.filter((defect) => defect.code !== "CO_ASSESSMENT_MISMATCH");
     }
 
-    // 1. Any CO present in a table but absent from the defined outcomes.
-    const extraCoMatches = rawSpecText.match(/\bCO-\d+\b/g);
-    if (extraCoMatches) {
-      const extraCos = [...new Set(extraCoMatches)].filter((cid) => !coIds.has(cid));
-      for (const extraCo of extraCos) {
+    // 1. Only inspect structured mapping/assessment rows, never narrative mentions.
+    const mappedCoIds = tableCoIds(rawSpecText, (line) => /\bPO[-\s]?1\b/i.test(line) && /\bPSO[-\s]?\d+\b/i.test(line) && line.includes("|"));
+    const assessedCoIds = tableCoIds(rawSpecText, (line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
+    for (const extraCo of [...new Set([...mappedCoIds, ...assessedCoIds])].filter((cid) => !coIds.has(cid))) {
+      const section = assessedCoIds.includes(extraCo) ? 7 : 5;
         const existing = output.defects.find(
           (d) =>
             d.code === "CO_EXTRA_IN_TABLE" ||
@@ -482,22 +528,21 @@ export function postValidateAndFix(
         );
         if (existing) {
           existing.code = "CO_EXTRA_IN_TABLE";
-          existing.location = { source: "spec", section: 7, refs: [extraCo] };
-          existing.description = `${extraCo} appears in the Section 7 assessment table but is not defined in Section 3 Course Outcomes.`;
-          existing.fix = `Removed ${extraCo} from assessment coverage and CO-PO-PSO map.`;
+          existing.location = { source: "spec", section, refs: [extraCo] };
+          existing.description = `${extraCo} appears in the Section ${section} table but is not defined in Section 3 Course Outcomes.`;
+          existing.fix = `Remove ${extraCo} from the Section ${section} table or define it in Section 3.`;
         } else {
           output.defects.push({
             code: "CO_EXTRA_IN_TABLE",
-            location: { source: "spec", section: 7, refs: [extraCo] },
-            description: `${extraCo} appears in the Section 7 assessment table but is not defined in Section 3 Course Outcomes.`,
-            fix: `Removed ${extraCo} from assessment coverage and CO-PO-PSO map.`,
+            location: { source: "spec", section, refs: [extraCo] },
+            description: `${extraCo} appears in the Section ${section} table but is not defined in Section 3 Course Outcomes.`,
+            fix: `Remove ${extraCo} from the Section ${section} table or define it in Section 3.`,
           });
         }
-      }
     }
 
-    // 2. Compare every PSO column mentioned in the source with Annexure config.
-    for (const psoId of new Set(rawSpecText.match(/\bPSO-\d+\b/gi) ?? [])) {
+    // 2. Compare only the Section 5 mapping-header PSO columns with Annexure config.
+    for (const psoId of sourceMapPsoColumns(rawSpecText)) {
       if (validPsoIds.has(psoId)) continue;
       const existing = output.defects.find((d) => d.code === "PSO_COLUMN_MISMATCH" && d.location.refs?.includes(psoId));
       if (!existing) {

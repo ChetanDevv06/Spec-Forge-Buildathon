@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import * as cheerio from "cheerio";
 import type { Express } from "express";
 import { extractFile, type ExtractionResult } from "./extract.js";
 import { generateJson, type LlmConfig } from "./llm.js";
@@ -267,6 +268,38 @@ function sourceAssessmentCoverage(rawText: string, componentNames: string[]): Re
   return coverage;
 }
 
+function sourceAssessmentComponents(rawText: string): SpecForgeOutput["assessment"]["components"] {
+  const header = rawText
+    .split(/\r?\n/)
+    .find((line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
+  if (!header) return [];
+  return header
+    .split("|")
+    .slice(1)
+    .flatMap((cell) => {
+      const match = cell.match(/^(.+?)\s*\(\s*Weightage:\s*(\d+(?:\.\d+)?)/i);
+      return match ? [{ name: match[1].trim(), weight_percent: Number(match[2]) }] : [];
+    });
+}
+
+function templateAssessmentComponents(template: TemplateType): SpecForgeOutput["assessment"]["components"] {
+  const filename = template === "integrated" ? "integrated_lab.html" : "non_lab.html";
+  const templatePath = path.resolve(process.cwd(), "templates", filename);
+  if (!fs.existsSync(templatePath)) return [];
+  const $ = cheerio.load(fs.readFileSync(templatePath, "utf8"));
+  return $("table.assessment-integrated-table thead tr")
+    .eq(1)
+    .find("th")
+    .slice(1)
+    .map((_, cell) => {
+      const text = $(cell).text().replace(/\s+/g, " ").trim();
+      const match = text.match(/^(.+?)\s*\(\s*Weightage:\s*(\d+(?:\.\d+)?)\s*%\s*\)$/i);
+      return match ? { name: match[1].trim(), weight_percent: Number(match[2]) } : null;
+    })
+    .get()
+    .filter((component): component is { name: string; weight_percent: number } => component !== null);
+}
+
 export function postValidateAndFix(
   output: SpecForgeOutput,
   rawSpecText: string = "",
@@ -336,6 +369,13 @@ export function postValidateAndFix(
   }
 
   // Harmonize assessment component names in co_coverage
+  const componentsFromSource = sourceAssessmentComponents(rawSpecText);
+  if (
+    componentsFromSource.length > 0 &&
+    Math.abs(componentsFromSource.reduce((sum, component) => sum + component.weight_percent, 0) - 100) < 0.01
+  ) {
+    output.assessment.components = componentsFromSource;
+  }
   const compNames = output.assessment.components.map((c) => c.name);
   for (const [coId, comps] of Object.entries(output.assessment.co_coverage)) {
     const fixedComps: string[] = [];
@@ -406,6 +446,21 @@ export function postValidateAndFix(
     )];
     if (sourceWeightages.length > 0 && sourceWeightages.reduce((sum, value) => sum + value, 0) === 100) {
       output.defects = output.defects.filter((defect) => defect.code !== "WEIGHTAGE_INCONSISTENT");
+    }
+    const templateComponents = templateAssessmentComponents(output.template);
+    const sourceSignature = output.assessment.components
+      .map((component) => `${component.name.toLowerCase()}:${component.weight_percent}`)
+      .join("|");
+    const templateSignature = templateComponents
+      .map((component) => `${component.name.toLowerCase()}:${component.weight_percent}`)
+      .join("|");
+    if (templateComponents.length > 0 && sourceSignature !== templateSignature) {
+      output.defects.push({
+        code: "WEIGHTAGE_INCONSISTENT",
+        location: { source: "template", section: 7, refs: [] },
+        description: `The selected template's Section 7 component weights (${templateSignature}) do not match the source-derived assessment components (${sourceSignature}).`,
+        fix: "Align the rendered Section 7 headers and subcomponent grouping with the source assessment table before treating the discrepancy as resolved.",
+      });
     }
     if (
       Object.keys(coverageFromSource).length > 0 &&

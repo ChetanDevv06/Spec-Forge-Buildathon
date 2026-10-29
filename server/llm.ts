@@ -25,16 +25,35 @@ function stripFences(text: string): string {
 
 async function callProvider(prompt: string, cfg: LlmConfig): Promise<string> {
   if (cfg.provider === "gemini") {
-    try {
-      const ai = new GoogleGenAI({ apiKey: cfg.key });
-      const r = await ai.models.generateContent({ model: cfg.model, contents: prompt, config: { responseMimeType: "application/json" } });
-      return r.text ?? "";
-    } catch (e: any) {
-      const status = Number(e?.status ?? e?.code ?? 0);
-      if (status === 429) throw new ApiError(429, "RATE_LIMITED", "The AI provider says too many requests. Wait a minute or switch model.");
-      if (status === 400 || status === 401 || status === 403) throw new ApiError(401, "BAD_KEY", "The provider rejected this key or model. Check Settings.");
-      throw new ApiError(502, "PROVIDER_ERROR", "The AI provider failed. Try again.");
+    const ai = new GoogleGenAI({ apiKey: cfg.key });
+    const modelsToTry = [cfg.model, "gemini-3.1-flash-lite"].filter((m, i, arr) => m && arr.indexOf(m) === i);
+    let lastError: any = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const r = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: { responseMimeType: "application/json" },
+        });
+        return r.text ?? "";
+      } catch (e: any) {
+        lastError = e;
+        const status = Number(e?.status ?? e?.code ?? 0);
+        // If 404 (model unavailable) or 429 (quota exceeded), try next model candidate
+        if (status === 404 || status === 429) {
+          continue;
+        }
+        if (status === 400 || status === 401 || status === 403) {
+          throw new ApiError(401, "BAD_KEY", "The provider rejected this key or model. Check Settings.");
+        }
+      }
     }
+
+    const finalStatus = Number(lastError?.status ?? lastError?.code ?? 0);
+    if (finalStatus === 429) throw new ApiError(429, "RATE_LIMITED", "The AI provider says too many requests. Wait a minute or switch model.");
+    if (finalStatus === 400 || finalStatus === 401 || finalStatus === 403) throw new ApiError(401, "BAD_KEY", "The provider rejected this key or model. Check Settings.");
+    throw new ApiError(502, "PROVIDER_ERROR", "The AI provider failed. Try again.");
   }
   if (cfg.provider === "anthropic") {
     const r = await fetch("https://api.anthropic.com/v1/messages", {

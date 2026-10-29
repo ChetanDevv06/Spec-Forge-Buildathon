@@ -328,6 +328,14 @@ export function sourceAssessmentComponents(rawText: string): SpecForgeOutput["as
     });
 }
 
+export function sourceAssessmentRawMarks(rawText: string): number[] {
+  const lines = rawText.split(/\r?\n/).map((line) => line.trim());
+  const headerIndex = lines.findIndex((line) => /^Course\s+Outcome\s*\|/i.test(line) && /Weightage/i.test(line));
+  if (headerIndex < 0) return [];
+  const marksRow = lines.slice(headerIndex + 1).find((line) => /\bmarks?\b/i.test(line) && line.includes("|"));
+  return marksRow ? [...marksRow.matchAll(/(\d+(?:\.\d+)?)\s*marks?\b/gi)].map((match) => Number(match[1])) : [];
+}
+
 function templateAssessmentComponents(template: TemplateType): SpecForgeOutput["assessment"]["components"] {
   const filename = template === "integrated" ? "integrated_lab.html" : "non_lab.html";
   const templatePath = path.resolve(process.cwd(), "templates", filename);
@@ -391,10 +399,15 @@ export function postValidateAndFix(
 
   // Load valid PSO IDs (synchronous)
   const validPsoIds = new Set<string>();
+  const mappingTargets = new Map<string, string>();
   try {
     const cfgPath = path.resolve(process.cwd(), "config/po_pso.json");
     const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-    for (const pso of cfg.psos ?? []) validPsoIds.add(pso.id);
+    for (const po of cfg.pos ?? []) mappingTargets.set(po.id, po.title ?? po.statement ?? po.id);
+    for (const pso of cfg.psos ?? []) {
+      validPsoIds.add(pso.id);
+      mappingTargets.set(pso.id, pso.title ?? String(pso.statement ?? pso.id).split(/[.;]/)[0]);
+    }
   } catch {
     // Keep generated evidence intact if the authoritative configuration cannot
     // be loaded. The request will fail later when configuration is required.
@@ -412,6 +425,22 @@ export function postValidateAndFix(
   const mapFromSource = sourceCourseMap(rawSpecText, validPsoIds);
   if (Object.keys(mapFromSource).length > 0) {
     output.co_po_pso_map = mapFromSource;
+    for (const outcome of output.course_outcomes) {
+      const row = output.co_po_pso_map[outcome.id];
+      if (!row) continue;
+      const outcomeFocus = outcome.statement
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/[.]+$/, "")
+        .split(" ")
+        .slice(0, 10)
+        .join(" ");
+      for (const [column, cell] of Object.entries(row)) {
+        if (!cell) continue;
+        const target = mappingTargets.get(column) ?? column;
+        cell.justification = `${outcome.id} addresses ${outcomeFocus}; the official Section 5 matrix assigns level ${cell.level} for ${target}.`;
+      }
+    }
   }
 
   // Harmonize assessment component names in co_coverage
@@ -591,6 +620,27 @@ export function postValidateAndFix(
         });
       }
     }
+
+    // 5. Raw Section 7 subcomponent maxima must be reconcilable with total course marks.
+    const courseTotal = rawSpecText.match(/Total\s+Course\s+Marks(?:\s*\|\s*|\s+)(\d+)/i)?.[1];
+    const assessmentMarks = sourceAssessmentRawMarks(rawSpecText);
+    const assessmentMarksTotal = assessmentMarks.reduce((sum, value) => sum + value, 0);
+    if (courseTotal && assessmentMarks.length > 0 && assessmentMarksTotal !== Number(courseTotal)) {
+      const existing = output.defects.find(
+        (defect) => defect.code === "MARKS_INCONSISTENT" && defect.location.source === "spec" && defect.location.section === 7
+      );
+      if (existing) {
+        existing.description = `Section 7 lists raw assessment maxima totalling ${assessmentMarksTotal} marks, while Section 2 declares total course marks of ${courseTotal}; no normalization rule is stated.`;
+        existing.fix = "Document the normalization from subcomponent marks to the course total, or revise the inconsistent values.";
+      } else {
+        output.defects.push({
+          code: "MARKS_INCONSISTENT",
+          location: { source: "spec", section: 7, refs: [] },
+          description: `Section 7 lists raw assessment maxima totalling ${assessmentMarksTotal} marks, while Section 2 declares total course marks of ${courseTotal}; no normalization rule is stated.`,
+          fix: "Document the normalization from subcomponent marks to the course total, or revise the inconsistent values.",
+        });
+      }
+    }
   }
 
   // Deduplicate and canonicalize defect list
@@ -623,7 +673,7 @@ export function postValidateAndFix(
       else if (d.code === "CO_MISSING_IN_TABLE") d.location.section = 5;
     }
 
-    const key = `${d.code}|${d.location.refs.sort().join(",")}`;
+    const key = `${d.code}|${d.location.source}|${d.location.section ?? "none"}|${d.location.refs.sort().join(",")}`;
     if (!seenCodes.has(key)) {
       seenCodes.add(key);
       canonicalDefects.push(d);

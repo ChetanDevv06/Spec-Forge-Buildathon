@@ -5,6 +5,7 @@ import {
   postValidateAndFix,
   sourceAssessmentComponents,
   sourceAssessmentCoverage,
+  sourceAssessmentRawMarks,
   sourceCourseMap,
 } from "../server/pipeline.js";
 import { SpecForgeOutputSchema } from "../server/schema.js";
@@ -40,6 +41,7 @@ async function main() {
   const coverage = sourceAssessmentCoverage(sample.text, components.map((component) => component.name));
   assert.deepEqual(coverage["CO-1"], ["CE", "SEE"]);
   assert.deepEqual(coverage["CO-6"], ["CE", "Lab"], "Lab CE remains CE while LSEE remains Lab");
+  assert.deepEqual(sourceAssessmentRawMarks(sample.text), [50, 25, 25, 50, 30]);
 
   const mergedHeaders = [
     "Programme Outcomes | Programme Specific Outcomes",
@@ -82,6 +84,7 @@ async function main() {
     "PO-1 | PSO-1\nCO-1 | 1 | 1\nNarrative text may mention CO-99 without placing it in a table."
   );
   assert.equal(withNarrative.defects.some((defect) => defect.location.refs?.includes("CO-99")), false);
+  assert.match(withNarrative.co_po_pso_map["CO-1"]?.["PO-1"]?.justification ?? "", /Engineering Knowledge/);
 
   console.log("Pipeline parsing regression tests passed.");
 }
